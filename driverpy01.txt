@@ -1,0 +1,247 @@
+# Databricks notebook source
+# MAGIC %run "../Classes/AXAHealthClassFactory"
+
+# COMMAND ----------
+
+import requests
+import time
+
+# Suppress pylint warnings
+spark: any  # type: ignore
+uc_helper: any  # type: ignore
+dbutils: any  # type: ignore
+debug_print: any  # type: ignore
+permission_helper: any  # type: ignore
+jdf_runtime_status_updater: any  # type: ignore
+
+dbutils.widgets.text("source", "<None>", "Source Name")
+dbutils.widgets.text("writeMethod", "<None>", "Write Method")
+dbutils.widgets.text("removeDuplicates", "<None>", "Remove Duplicates")
+dbutils.widgets.text("JDFGroupName", "<None>", "JDFGroupName")
+dbutils.widgets.text("archive", "false", "archive")
+dbutils.widgets.text("tableList0", "<None>", "Table List 0")
+dbutils.widgets.text("tableList1", "<None>", "Table List 1")
+dbutils.widgets.text("tableList2", "<None>", "Table List 2")
+dbutils.widgets.text("tableList3", "<None>", "Table List 3")
+dbutils.widgets.text("tableList4", "<None>", "Table List 4")
+dbutils.widgets.text("tableList5", "<None>", "Table List 5")
+dbutils.widgets.text("tableList6", "<None>", "Table List 6")
+dbutils.widgets.text("tableList7", "<None>", "Table List 7")
+dbutils.widgets.text("tableList8", "<None>", "Table List 8")
+dbutils.widgets.text("tableList9", "<None>", "Table List 9")
+
+source = dbutils.widgets.get("source").replace('-', '_')
+write_method = dbutils.widgets.get("writeMethod")
+remove_duplicates = dbutils.widgets.get("removeDuplicates")
+jdf_group_name = dbutils.widgets.get("JDFGroupName")
+archive = dbutils.widgets.get("archive")
+table_list_0 = dbutils.widgets.get("tableList0")
+table_list_1 = dbutils.widgets.get("tableList1")
+table_list_2 = dbutils.widgets.get("tableList2")
+table_list_3 = dbutils.widgets.get("tableList3")
+table_list_4 = dbutils.widgets.get("tableList4")
+table_list_5 = dbutils.widgets.get("tableList5")
+table_list_6 = dbutils.widgets.get("tableList6")
+table_list_7 = dbutils.widgets.get("tableList7")
+table_list_8 = dbutils.widgets.get("tableList8")
+table_list_9 = dbutils.widgets.get("tableList9")
+
+# COMMAND ----------
+
+# NEW FUNCTION: Detect if staging contains PDF files by checking actual file extensions
+def detect_file_type_from_staging(source_name):
+    """
+    Checks the staging area to detect file type based on actual files present
+    
+    Path checked: data/staging/<source>/
+    
+    Logic:
+    - If .pdf files found -> return 'pdf'
+    - If .parquet files found -> return 'standard'
+    - Default -> 'standard'
+    
+    Returns: 'pdf' or 'standard'
+    """
+    try:
+        # Check the staging path for this source
+        staging_path = f"dbfs:/mnt/dataplatform/data/staging/{source_name}/"
+        
+        debug_print("Checking Staging Path", staging_path)
+        
+        try:
+            # List all files in staging
+            files = dbutils.fs.ls(staging_path)
+            
+            if not files:
+                debug_print("File Type Detection", f"No files found in {staging_path}, defaulting to standard")
+                return 'standard'
+            
+            # Check for PDF files
+            pdf_files = [f for f in files if f.name.lower().endswith('.pdf')]
+            
+            # Check for Parquet files
+            parquet_files = [f for f in files if f.name.lower().endswith('.parquet')]
+            
+            if pdf_files:
+                debug_print("File Type Detection", f"PDF - Found {len(pdf_files)} PDF file(s) in {staging_path}")
+                debug_print("PDF Files", [f.name for f in pdf_files])
+                return 'pdf'
+            elif parquet_files:
+                debug_print("File Type Detection", f"STANDARD - Found {len(parquet_files)} Parquet file(s) in {staging_path}")
+                return 'standard'
+            else:
+                # Check for other standard formats (csv, excel, etc.)
+                debug_print("File Type Detection", f"STANDARD - Found {len(files)} file(s), defaulting to standard processing")
+                return 'standard'
+                
+        except Exception as e:
+            # Staging path doesn't exist or can't be accessed
+            debug_print("Staging Path Error", f"Cannot access {staging_path}: {str(e)}")
+            debug_print("File Type Detection", "Defaulting to standard processing")
+            return 'standard'
+        
+    except Exception as e:
+        debug_print("File Type Detection Error", str(e))
+        return 'standard'
+
+# COMMAND ----------
+
+workspace_id = spark.conf.get("spark.databricks.workspaceUrl")
+
+def get_api_headers():
+    """
+    Gets the headers required to pass into a rest api call
+    """
+    environment = uc_helper.get_environment()
+
+    auth_token_dict = {
+        "pr": "***********************",
+        "pp": "***********************",
+        "qa": "***********************",
+        "dv": "***********************"
+    }
+
+    # If workspace id is an old 02 workspaces then use these tokens
+    if workspace_id in ["adb-5474458202.2.azuredatabricks.net", "adb-8979119587280.0.azuredatabricks.net", 
+                        "adb-4711226113.13.azuredatabricks.net", "adb-430975400260.0.azuredatabricks.net"]:
+        auth_token_dict = {
+            "pr": "***********************",
+            "pp": "***********************",
+            "qa": "***********************",
+            "dv": "***********************"
+        }
+
+    auth_token = dbutils.secrets.get(scope=f"z-ppp-en1-{environment}-dbr-secretScope01", key=auth_token_dict[environment])
+
+    return {"Content-Type":"application/json", "Authorization": f"Bearer {auth_token}"}
+
+# COMMAND ----------
+
+# Detect file type from staging area based on actual files present
+file_type = detect_file_type_from_staging(source)
+debug_print("Detected File Type for Source", f"source='{source}' -> file_type='{file_type}'")
+
+# COMMAND ----------
+
+# Endpoint gets a list of all job workflows in this workspace
+url = f"https://{workspace_id}/api/2.1/jobs/list"
+headers = get_api_headers()
+
+# The name of the main workflow for all unity catalog ingestions
+master_ingestion_name = 'Master Ingestion Process'
+
+# Make request to api
+response = requests.get(f"{url}?name={master_ingestion_name}", headers=headers)
+json_response = response.json()
+
+# Get the id of the main workflow
+master_ingestion_id = json_response['jobs'][0]['job_id']
+
+# COMMAND ----------
+
+# Combine all table list parameters into one list of lists of tables so that we can iterate later
+table_list = [table_list_0, table_list_1, table_list_2, table_list_3, table_list_4, 
+              table_list_5, table_list_6, table_list_7, table_list_8, table_list_9] 
+
+url = f"https://{workspace_id}/api/2.1/jobs/run-now"
+headers = get_api_headers()
+
+run_ids = []
+for table_items in table_list:
+    # Only create a new job run if there are tables to be processed
+    if table_items not in ['[]', '<None>']:
+        data = {
+            'job_id': master_ingestion_id,
+            'notebook_params': {
+                'task_name': '{{task_key}}',
+                'source': source,
+                'write_method': write_method,
+                'remove_duplicates': remove_duplicates,
+                'table_names': table_items,
+                'archive': archive,
+                'file_type': file_type,  # Pass detected file type to Parent
+            },
+        }
+
+        # Make request to api
+        response = requests.post(f"{url}", headers=headers, json=data)
+        json_response = response.json()
+
+        # Add each new job run id to a list of run ids
+        run_ids.append(json_response['run_id'])
+
+# Hyperlinks for job runs that have been created
+debug_print('Job runs created', [f'https://{workspace_id}/jobs/{master_ingestion_id}/runs/{run}' for run in run_ids], multi_row=True)
+
+# COMMAND ----------
+
+debug_print("Run ids to process", run_ids, multi_row=True) 
+
+# End point to get the details of a job run based on a run id
+url = f"https://{workspace_id}/api/2.1/jobs/runs/get?run_id="
+
+responses = []
+for run_id in run_ids:
+    # Check that a single run id has completed in databricks
+    run_completed = False
+
+    while not run_completed:
+        # Keep polling run id to see if it has completed or not
+        # Exit while loop once a run is complete
+        response = requests.get(f"{url}{run_id}", headers=headers)
+        if response.status_code == 400:
+            print(f"Run Id {run_id} is invalid")
+            responses.append({'result_state': response.status_code, 'run_id': run_id})
+            break
+        else:
+            response = response.json()['state']
+
+            if response['life_cycle_state'] not in ['TERMINATED', 'INTERNAL_ERROR', 'SKIPPED']:
+                # Only sleep if we need to re-do loop
+                time.sleep(15)
+            else:
+                run_completed = True
+                response['run_id'] = run_id
+                responses.append(response)
+                print(f"Run Id {run_id} Completed")
+
+# COMMAND ----------
+
+# Post ingestion, we want to refresh all source permissions
+# We only want to do SILVER catalog as end users do not access BRONZE and all Platform Data Engineers should have 'ALL Privileges' set
+permission_helper.refresh_permissions(uc_helper.get_catalog_name('SILVER'), specific_source=source)
+
+# COMMAND ----------
+
+failed_run_ids = [response['run_id'] for response in responses if response['result_state'] != 'SUCCESS' or 400 in response]
+
+if jdf_group_name not in ['dss_batch1_ingestion','dss_batch2_ingestion','dss_batch3_ingestion','dss_batch4_ingestion','dss_batch5_ingestion','dss_views_ingestion']:
+    if jdf_runtime_status_updater.jdf_enabled_group(jdf_group_name):
+        jdf_job_group_id = jdf_runtime_status_updater.get_job_group_id(jdf_group_name)
+        jdf_runtime_status_updater.fail_unprocessed_jobs(jdf_job_group_id)
+
+if failed_run_ids:
+    return_to_adf = f"FAILURE on run ids: {failed_run_ids}"
+    dbutils.notebook.exit(return_to_adf)
+else:
+    dbutils.notebook.exit("SUCCESS")
